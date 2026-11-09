@@ -1,15 +1,13 @@
 <?php
 
 /**
- * Typecho 多语言支持（可行性验证原型）
+ * Typecho 多语言支持
  *
- * 原始语言保存在 Typecho 自带的 contents / metas / fields / options 表中，
- * 其他语言保存在本插件创建的 ml_* 表中。前台通过语言前缀（/en/...）或
- * Cookie 选择语言，后台在文章/页面编辑页和“多语言”面板维护译文。
+ * 支持通过访客的语言偏好自动选择语言，并允许访客手动指定。后台文章/页面编辑页新增语言选择编辑功能。后台完整“多语言”面板可用于维护标签、分类等杂项译文。插件间兼容性良好。另提供相关API供主题等二次开发。详情请见 README.md。
  *
  * @package MultiLanguage
- * @author OpenCode Prototype
- * @version 0.2.0
+ * @author MultiLanguage Contributors
+ * @version 0.1.0
  * @link https://typecho.org
  */
 namespace TypechoPlugin\MultiLanguage;
