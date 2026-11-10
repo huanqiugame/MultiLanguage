@@ -184,7 +184,8 @@ CREATE TABLE typecho_multilang_options (
 
 | 文件 | 说明 |
 | --- | --- |
-| `Plugin.php` | 插件入口：启停、建表、语言解析、内容过滤、编辑器集成、路由与 action 注册 |
+| `Plugin.php` | 插件入口：启停、设置、语言解析入口与公开 API 门面 |
+| `Traits/` | 按职责拆分的内部实现：slug、路由、译文读写、后台校验、建表迁移、内容过滤、主题 API |
 | `Route.php` | 语言前缀路由，把 `/[lang]/...` 解析回 Typecho 原生路由 |
 | `SwitchAction.php` | 语言切换 action，负责校验语言、记住选择和跳转 |
 | `Manage.php` | 后台“多语言”面板 |
@@ -197,5 +198,5 @@ CREATE TABLE typecho_multilang_options (
 插件为纯 PHP 实现，无 Composer 依赖。修改后可运行语法检查：
 
 ```bash
-for file in *.php; do php -l "$file"; done
+for file in *.php Traits/*.php; do php -l "$file"; done
 ```
