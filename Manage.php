@@ -126,6 +126,9 @@ if ($request->isPost()) {
                 $conflict['slug']
             );
         }
+        foreach ($pluginClass::translationSlugConflicts($result) as $message) {
+            $errors[] = $message;
+        }
 
         if ($errors) {
             \Widget\Notice::alloc()->set(implode('<br>', $errors), 'error');
@@ -142,6 +145,52 @@ if ($request->isPost()) {
 
     if ($tab === 'meta' && $lang !== $defaultLang) {
         $rows = $request->get('meta', []);
+        $metaErrors = [];
+        $seenSlugs = [];
+        if (is_array($rows)) {
+            foreach ($rows as $mid => $data) {
+                if (!is_array($data)) {
+                    continue;
+                }
+
+                $type = (string)($data['type'] ?? '');
+                if (!in_array($type, ['category', 'tag'], true)) {
+                    $typeRow = $db->fetchRow(
+                        $db->select('type')->from('table.metas')->where('mid = ?', (int)$mid)->limit(1)
+                    );
+                    $type = (string)($typeRow['type'] ?? '');
+                }
+
+                $slug = trim((string)($data['slug'] ?? ''));
+                if ($slug === '') {
+                    continue;
+                }
+
+                $normalized = $pluginClass::normalizeTranslationSlug($slug);
+                if (isset($seenSlugs[$normalized])) {
+                    $metaErrors[$mid] = sprintf(
+                        _t('译文缩略名 “%s” 在本次提交中重复。'),
+                        $normalized
+                    );
+                    continue;
+                }
+                $seenSlugs[$normalized] = true;
+
+                $message = $pluginClass::metaTranslationSlugError($slug, $lang, (int)$mid, $type);
+                if ($message !== null) {
+                    $metaErrors[$mid] = $message;
+                }
+            }
+        }
+
+        if ($metaErrors) {
+            \Widget\Notice::alloc()->set(implode('<br />', $metaErrors), 'error');
+            $response->redirect($options->adminUrl(
+                $panelUrl . '&tab=meta&lang=' . rawurlencode($lang),
+                true
+            ));
+        }
+
         if (is_array($rows)) {
             foreach ($rows as $mid => $data) {
                 if (!is_array($data)) {
@@ -335,7 +384,7 @@ include 'menu.php';
                             <?php if ($lang !== $defaultLang): ?>
                                 <th><?php _e('译文名称'); ?></th>
                                 <th><?php _e('译文描述'); ?></th>
-                                <th><?php _e('译文缩略名（预留）'); ?></th>
+                                <th><?php _e('译文缩略名'); ?></th>
                             <?php endif; ?>
                         </tr>
                         </thead>
@@ -343,7 +392,14 @@ include 'menu.php';
                         <?php foreach ($metas as $meta): ?>
                             <?php $tr = $meta['translation'] ?? []; ?>
                             <tr>
-                                <td><?php echo $meta['type'] === 'category' ? _t('分类') : _t('标签'); ?></td>
+                                <td>
+                                    <?php echo $meta['type'] === 'category' ? _t('分类') : _t('标签'); ?>
+                                    <?php if ($lang !== $defaultLang): ?>
+                                        <input type="hidden"
+                                               name="meta[<?php echo (int)$meta['mid']; ?>][type]"
+                                               value="<?php echo htmlspecialchars((string)$meta['type'], ENT_QUOTES, 'UTF-8'); ?>" />
+                                    <?php endif; ?>
+                                </td>
                                 <td><?php echo htmlspecialchars((string)$meta['name'], ENT_QUOTES, 'UTF-8'); ?></td>
                                 <td><?php echo htmlspecialchars((string)$meta['description'], ENT_QUOTES, 'UTF-8'); ?></td>
                                 <?php if ($lang !== $defaultLang): ?>

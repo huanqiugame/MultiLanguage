@@ -61,7 +61,10 @@ class Route extends Archive
             throw new WidgetException('Path not found', 404);
         }
 
-        foreach ($match['params'] as $name => $value) {
+        // 译文缩略名只存在于地址中，查询前必须映射回原文缩略名/cid。
+        $params = Plugin::resolveRouteParams($lang, $match['name'], $match['params'], $match['route']);
+
+        foreach ($params as $name => $value) {
             $this->request->setParam($name, $value);
         }
 
@@ -75,7 +78,7 @@ class Route extends Archive
      * 在原始路由表中匹配去掉语言前缀后的路径。
      *
      * @param string $path
-     * @return array{name:string,widget:string,params:array<string,string>}|null
+     * @return array{name:string,widget:string,params:array<string,string>,route:array}|null
      */
     private static function matchInnerPath(string $path): ?array
     {
@@ -97,11 +100,31 @@ class Route extends Archive
                     'name'   => (string)$name,
                     'widget' => (string)($route['widget'] ?? ''),
                     'params' => $params,
+                    'route'  => $route,
                 ];
             }
         }
 
         return null;
+    }
+
+    /**
+     * 多级页面/分类目录需要使用译文缩略名生成 canonical 地址。
+     *
+     * @return array<int, string>
+     */
+    protected function ___directory(): array
+    {
+        if (Plugin::isDefaultLang()) {
+            return parent::___directory();
+        }
+
+        $type = (string)($this->parameter->type ?? '');
+        if ($type === 'page') {
+            return Plugin::translatedPageDirectory((int)$this->cid, Plugin::currentLang());
+        }
+
+        return Plugin::translateMetaDirectory(parent::___directory(), Plugin::currentLang());
     }
 
     private static function isOwnRoute(string $name): bool

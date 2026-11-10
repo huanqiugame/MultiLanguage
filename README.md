@@ -33,6 +33,7 @@
 - 在“多语言 → 语言”中新增语言，例如 `en`、`ja`，并设置默认语言。
 - 在“多语言 → 分类 / 标签”和“多语言 → 站点信息”中填写对应语言的译文。
 - 翻译文章或页面：打开编辑页，在标题上方的语言下拉框中选择目标语言，编辑并保存。原文和译文会分别保存。
+- 译文编辑页的“网址缩略名”可以单独填写；留空时该译文沿用原文地址。填写后会做冲突检查并用于当前语言的链接。
 - 在“多语言 → 文章 / 页面”中可以查看哪些内容已有译文。
 
 ### 语言地址
@@ -79,6 +80,7 @@ Plugin::option('title', 'en');  // 指定语言的站点标题
 ### 路由说明
 
 - 语言代码只占用地址第一段，剩余路径交回 Typecho 原生路由，归档、分页、评论和 feed 保持原有行为。
+- 译文缩略名会用于当前语言的地址；访问原文缩略名会 301 到译文地址，切换语言和 hreflang 也会映射到目标语言的缩略名。
 - 插件会按当前语言调整 Typecho 生成的地址，文章、分类、标签、分页和 feed 的链接会自动带上语言前缀。
 - 评论和评论分页继续使用 Typecho 原生路由，插件不会为它们重复注册前缀路由。
 - `/action/...`、`/feed...`、`/sitemap-*.xml` 等系统地址不受语言前缀影响。
@@ -95,7 +97,9 @@ Plugin::option('title', 'en');  // 指定语言的站点标题
 
 ### 缩略名冲突
 
-语言代码会占用地址第一段，因此分类目录、分类、标签、页面和文章的缩略名不能与语言代码相同。保存时插件会自动检查并阻止冲突。
+语言代码会占用地址第一段，因此分类目录、分类、标签、页面和文章的缩略名不能与语言代码相同。保存时插件会自动检查并阻止冲突；启用插件和保存后台永久链接设置时也会先用当前路径规则做一次完整校验。
+
+译文可以单独填写缩略名。保存时会检查语言代码、路由路径、分类目录、其他内容/译文缩略名，并通过 `(lang, slug)` 唯一索引避免重复。没有填写译文缩略名的内容继续沿用原文地址。
 
 ### SEO 与 sitemap
 
@@ -136,7 +140,7 @@ CREATE TABLE typecho_multilang_contents (
   modified INTEGER DEFAULT 0,
   PRIMARY KEY (cid, lang)
 );
-CREATE INDEX typecho_ml_contents_lang_slug ON typecho_multilang_contents (lang, slug);
+CREATE UNIQUE INDEX typecho_ml_contents_lang_slug_unique ON typecho_multilang_contents (lang, slug);
 
 CREATE TABLE typecho_multilang_metas (
   mid         INTEGER NOT NULL,
@@ -146,7 +150,7 @@ CREATE TABLE typecho_multilang_metas (
   description VARCHAR(255),
   PRIMARY KEY (mid, lang)
 );
-CREATE INDEX typecho_ml_metas_lang_slug ON typecho_multilang_metas (lang, slug);
+CREATE UNIQUE INDEX typecho_ml_metas_lang_slug_unique ON typecho_multilang_metas (lang, slug);
 
 CREATE TABLE typecho_multilang_fields (
   cid       INTEGER NOT NULL,
@@ -168,7 +172,7 @@ CREATE TABLE typecho_multilang_options (
 
 ## 兼容性与已知限制
 
-- 译文沿用原文地址，译文自己的 slug 暂未接入路由。
+- 译文缩略名已接入路由；未填写译文缩略名的内容沿用原文地址。
 - 搜索目前只搜索默认语言；ExSearch 插件需要单独扩展才能搜索译文。
 - 评论、附件和 RSS 已基本可用，附件在各语言下的地址仍需逐项验证。
 - 自定义字段翻译表已建立，前台尚未接入。

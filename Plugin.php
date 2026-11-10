@@ -40,6 +40,7 @@ class Plugin implements PluginInterface
     private const ACTION_NAME = 'ml-lang';
     private const PATH_MODE_ROOT = 'root';
     private const PATH_MODE_PREFIX = 'prefix';
+    private const SCHEMA_VERSION = 4;
 
     /** 历史版本注册过、现在由原生路由直接处理的路径。 */
     private const OBSOLETE_ROUTES = ['ml_feedback', 'ml_comment_page'];
@@ -121,9 +122,22 @@ class Plugin implements PluginInterface
             throw new PluginException(_t('插件目录名必须为 MultiLanguage'));
         }
 
+        // 路径设置与语言代码冲突时禁止启用，避免语言前缀抢占现有地址。
+        $languageConflicts = self::conflictingSlugs(self::languageMap());
+        if ($languageConflicts) {
+            throw new PluginException(self::conflictMessages($languageConflicts));
+        }
+
         self::installTables();
         self::installDefaultConfig();
         self::normalizeLanguageRows();
+
+        $translationConflicts = self::translationSlugConflicts(self::languageMap());
+        if ($translationConflicts) {
+            throw new PluginException(implode('<br />', $translationConflicts));
+        }
+
+        self::ensureSchema();
 
         // 前台入口：在路由分发前解析语言，并覆盖站点标题/描述。
         TypechoPlugin::factory('index.php')->begin = [__CLASS__, 'begin'];
@@ -284,6 +298,13 @@ class Plugin implements PluginInterface
         }
 
         $path = (string)$request->getPathInfo();
+
+        // 永久链接设置会改变路径第一段，保存前必须重新验证语言代码冲突。
+        if (strpos($path, 'options-permalink') !== false) {
+            self::guardPermalinkSettings($request);
+            return;
+        }
+
         $languages = self::languageMap();
 
         if (strpos($path, 'metas-category-edit') !== false || strpos($path, 'metas-tag-edit') !== false) {
@@ -292,11 +313,10 @@ class Plugin implements PluginInterface
                 return;
             }
 
-            $slug = (string)$request->get('slug');
+            $slug = self::normalizeTranslationSlug((string)$request->get('slug'));
             if ($slug === '') {
-                $slug = (string)$request->get('name');
+                $slug = self::normalizeTranslationSlug((string)$request->get('name'));
             }
-            $slug = strtolower(Common::slugName($slug));
 
             if ($slug !== '' && isset($languages[$slug])) {
                 self::rejectSlug($slug, strpos($path, 'metas-category-edit') !== false ? _t('分类') : _t('标签'));
@@ -316,8 +336,28 @@ class Plugin implements PluginInterface
             return;
         }
 
+        $routeName = strpos($path, 'contents-page-edit') !== false ? 'page' : 'post';
+        $translationLang = self::requestedAdminLang();
+        $slug = self::normalizeTranslationSlug((string)$request->get('slug'));
+
+        if ($translationLang !== null) {
+            // 译文模式下只校验译文缩略名，原文字段由 prepareWrite() 恢复。
+            if ($slug !== '') {
+                $message = self::contentTranslationSlugError(
+                    $slug,
+                    $translationLang,
+                    (int)$request->get('cid'),
+                    $routeName
+                );
+                if ($message !== null) {
+                    self::rejectConflict($message);
+                }
+            }
+            return;
+        }
+
         // 文章目录来自分类缩略名，先检查本次提交的分类。
-        if (strpos($path, 'contents-post-edit') !== false) {
+        if ($routeName === 'post') {
             $categoryIds = $request->get('category', []);
             if (is_array($categoryIds) && $categoryIds) {
                 $db = Db::get();
@@ -327,20 +367,17 @@ class Plugin implements PluginInterface
                         ->where('mid IN ?', array_map('intval', $categoryIds))
                 );
                 foreach ($rows as $row) {
-                    $slug = strtolower((string)$row['slug']);
-                    if ($slug !== '' && isset($languages[$slug])) {
-                        self::rejectSlug($slug, _t('分类目录'));
+                    $categorySlug = self::normalizeTranslationSlug((string)$row['slug']);
+                    if ($categorySlug !== '' && isset($languages[$categorySlug])) {
+                        self::rejectSlug($categorySlug, _t('分类目录'));
                     }
                 }
             }
         }
 
-        $routeName = strpos($path, 'contents-page-edit') !== false ? 'page' : 'post';
-        $slug = (string)$request->get('slug');
         if ($slug === '') {
-            $slug = (string)$request->get('title');
+            $slug = self::normalizeTranslationSlug((string)$request->get('title'));
         }
-        $slug = strtolower(Common::slugName($slug));
 
         if ($slug !== '' && isset($languages[$slug])) {
             // 页面缩略名始终保留；文章缩略名只在它确实占用路径第一段时阻止。
@@ -348,6 +385,710 @@ class Plugin implements PluginInterface
                 self::rejectSlug($slug, $routeName === 'page' ? _t('页面') : _t('文章'));
             }
         }
+    }
+
+    /**
+     * 保存永久链接前，用新的路由表验证语言代码和译文缩略名冲突。
+     *
+     * @param Request $request
+     */
+    private static function guardPermalinkSettings(Request $request): void
+    {
+        $postPattern = $request->get('postPattern');
+        if (!is_string($postPattern) || $postPattern === '') {
+            return;
+        }
+
+        if ($postPattern === 'custom') {
+            $customPattern = $request->get('customPattern');
+            if (!is_string($customPattern) || trim($customPattern) === '') {
+                return;
+            }
+            $postPattern = '/' . ltrim(self::encodePermalinkRule($customPattern), '/');
+        }
+
+        $pagePattern = $request->get('pagePattern');
+        $categoryPattern = $request->get('categoryPattern');
+        if (!is_string($pagePattern) || !is_string($categoryPattern)) {
+            return;
+        }
+
+        $raw = Options::alloc()->routingTable;
+        unset($raw[0]);
+        if (!isset($raw['post'], $raw['page'], $raw['category'])) {
+            return;
+        }
+
+        $raw['post']['url'] = $postPattern;
+        $raw['page']['url'] = '/' . ltrim(self::encodePermalinkRule($pagePattern), '/');
+        $raw['category']['url'] = '/' . ltrim(self::encodePermalinkRule($categoryPattern), '/');
+        if (isset($raw['category_page'])) {
+            $raw['category_page']['url'] = rtrim($raw['category']['url'], '/') . '/[page:digital]/';
+        }
+
+        try {
+            $parsed = (new \Typecho\Router\Parser($raw))->parse();
+        } catch (\Throwable $e) {
+            return;
+        }
+
+        $languages = self::languageMap();
+        $messages = array_merge(
+            self::conflictMessageList(self::conflictingSlugs($languages, $parsed)),
+            self::translationSlugConflicts($languages, $parsed)
+        );
+
+        if ($messages) {
+            \Widget\Notice::alloc()->set(implode('<br />', $messages), 'error');
+            Options::alloc()->response->goBack();
+        }
+    }
+
+    /**
+     * 与核心 Permalink 组件相同的规则编码。
+     *
+     * @param string $rule
+     * @return string
+     */
+    private static function encodePermalinkRule(string $rule): string
+    {
+        return str_replace(
+            ['{cid}', '{slug}', '{category}', '{directory}', '{year}', '{month}', '{day}', '{mid}'],
+            [
+                '[cid:digital]', '[slug]', '[category]', '[directory:split:0]',
+                '[year:digital:4]', '[month:digital:2]', '[day:digital:2]', '[mid:digital]',
+            ],
+            $rule
+        );
+    }
+
+    /**
+     * @param array<string, array{slug:string,label:string}> $conflicts
+     * @return array<int, string>
+     */
+    private static function conflictMessageList(array $conflicts): array
+    {
+        $messages = [];
+        foreach ($conflicts as $code => $conflict) {
+            $messages[] = sprintf(
+                _t('语言代码 “%s” 与%s “%s” 冲突，请先修改该路径或语言代码。'),
+                $code,
+                $conflict['label'],
+                $conflict['slug']
+            );
+        }
+
+        return $messages;
+    }
+
+    /**
+     * @param array<string, array{slug:string,label:string}> $conflicts
+     * @return string
+     */
+    private static function conflictMessages(array $conflicts): string
+    {
+        return implode('<br />', self::conflictMessageList($conflicts));
+    }
+
+    /**
+     * 提示译文缩略名冲突并回退。
+     *
+     * @param string $message
+     */
+    private static function rejectConflict(string $message): void
+    {
+        \Widget\Notice::alloc()->set($message, 'error');
+        Options::alloc()->response->goBack();
+    }
+
+    /**
+     * 归一化译文缩略名。译文地址统一使用小写，避免大小写造成重复路由。
+     *
+     * @param string $slug
+     * @return string
+     */
+    public static function normalizeTranslationSlug(string $slug): string
+    {
+        $slug = strtolower(trim($slug));
+        if ($slug === '') {
+            return '';
+        }
+
+        return Common::slugName($slug);
+    }
+
+    /**
+     * 把地址里的译文缩略名映射回原文缩略名，保证核心查询能命中原文。
+     *
+     * @param string $lang
+     * @param string $routeName
+     * @param array<string, string> $params
+     * @param array $route
+     * @return array<string, string>
+     */
+    public static function resolveRouteParams(
+        string $lang,
+        string $routeName,
+        array $params,
+        array $route
+    ): array {
+        $lang = strtolower($lang);
+        if ($lang === self::defaultLang()) {
+            return $params;
+        }
+
+        $hasSlug = isset($params['slug']) && is_string($params['slug']) && $params['slug'] !== '';
+        $hasDirectory = isset($params['directory']) && is_string($params['directory']) && $params['directory'] !== '';
+
+        if ($routeName === 'post' || $routeName === 'page') {
+            if ($routeName === 'post' && !$hasSlug) {
+                return $params;
+            }
+
+            if ($hasSlug) {
+                $candidate = $params['slug'];
+            } elseif ($routeName === 'page' && $hasDirectory) {
+                $candidate = self::lastPathSegment($params['directory']);
+            } else {
+                return $params;
+            }
+
+            $translation = self::fetchContentTranslationBySlug($lang, $candidate, $routeName);
+            if (!$translation) {
+                return $params;
+            }
+
+            $cid = (int)$translation['cid'];
+            if (isset($params['cid']) && (int)$params['cid'] !== $cid) {
+                return $params;
+            }
+
+            $sourceSlug = (string)($translation['source_slug'] ?? '');
+            if ($sourceSlug === '') {
+                return $params;
+            }
+
+            if ($hasSlug) {
+                $params['slug'] = $sourceSlug;
+            }
+
+            // 独立页面可能使用多级 directory，必须整体换回原目录才能命中并生成 canonical。
+            if ($routeName === 'page' && $hasDirectory) {
+                $params['directory'] = implode('/', self::sourcePageDirectory($cid));
+            }
+
+            return $params;
+        }
+
+        if ($routeName === 'category' || $routeName === 'tag') {
+            if (!$hasSlug) {
+                return $params;
+            }
+
+            $translation = self::fetchMetaTranslationBySlug($lang, $params['slug'], $routeName);
+            if (!$translation) {
+                return $params;
+            }
+
+            if (isset($params['mid']) && (int)$params['mid'] !== (int)$translation['mid']) {
+                return $params;
+            }
+
+            $sourceSlug = (string)($translation['source_slug'] ?? '');
+            if ($sourceSlug !== '') {
+                $params['slug'] = $sourceSlug;
+            }
+        }
+
+        return $params;
+    }
+
+    /**
+     * 多级页面的译文目录，按父级链逐级替换缩略名。
+     *
+     * @param int $cid
+     * @param string $lang
+     * @return array<int, string>
+     */
+    public static function translatedPageDirectory(int $cid, string $lang): array
+    {
+        $directory = self::sourcePageDirectory($cid);
+        if (strtolower($lang) === self::defaultLang()) {
+            return $directory;
+        }
+
+        foreach ($directory as $index => $slug) {
+            $translation = self::fetchContentTranslationBySourceSlug($lang, $slug, 'page');
+            if ($translation && !empty($translation['slug'])) {
+                $directory[$index] = (string)$translation['slug'];
+            }
+        }
+
+        return $directory;
+    }
+
+    /**
+     * 分类目录是多级结构，逐段替换为译文缩略名。
+     *
+     * @param array<int, string> $slugs
+     * @param string $lang
+     * @return array<int, string>
+     */
+    public static function translateMetaDirectory(array $slugs, string $lang): array
+    {
+        if (strtolower($lang) === self::defaultLang()) {
+            return $slugs;
+        }
+
+        foreach ($slugs as $index => $slug) {
+            if (!is_string($slug) || $slug === '') {
+                continue;
+            }
+            $translation = self::fetchMetaTranslationBySourceSlug($lang, $slug);
+            if ($translation && !empty($translation['slug'])) {
+                $slugs[$index] = (string)$translation['slug'];
+            }
+        }
+
+        return $slugs;
+    }
+
+    /**
+     * 原文页面的完整目录（含自身）。
+     *
+     * @param int $cid
+     * @return array<int, string>
+     */
+    private static function sourcePageDirectory(int $cid): array
+    {
+        $directory = [];
+        $seen = [];
+        $db = Db::get();
+
+        while ($cid > 0 && !isset($seen[$cid])) {
+            $seen[$cid] = true;
+            try {
+                $row = $db->fetchRow(
+                    $db->select('cid', 'slug', 'parent')
+                        ->from('table.contents')
+                        ->where('cid = ?', $cid)
+                        ->where('type = ?', 'page')
+                        ->limit(1)
+                );
+            } catch (\Throwable $e) {
+                break;
+            }
+
+            if (!$row) {
+                break;
+            }
+
+            array_unshift($directory, (string)$row['slug']);
+            $cid = (int)$row['parent'];
+        }
+
+        return $directory;
+    }
+
+    /**
+     * @param string $path
+     * @return string
+     */
+    private static function lastPathSegment(string $path): string
+    {
+        $segments = explode('/', trim($path, '/'));
+        $segment = end($segments);
+
+        return is_string($segment) ? $segment : '';
+    }
+
+    /**
+     * 按译文缩略名查找内容。
+     *
+     * @param string $lang
+     * @param string $slug
+     * @param string $type
+     * @return array|null
+     */
+    private static function fetchContentTranslationBySlug(string $lang, string $slug, string $type): ?array
+    {
+        $db = Db::get();
+
+        try {
+            $row = $db->fetchRow(
+                $db->select(
+                    'table.multilang_contents.cid',
+                    'table.multilang_contents.slug',
+                    ['table.contents.slug' => 'source_slug'],
+                    ['table.contents.type' => 'source_type']
+                )
+                    ->from('table.multilang_contents')
+                    ->join('table.contents', 'table.contents.cid = table.multilang_contents.cid')
+                    ->where('table.multilang_contents.lang = ?', strtolower($lang))
+                    ->where('table.multilang_contents.slug = ?', $slug)
+                    ->where('table.contents.type = ?', $type)
+                    ->limit(1)
+            );
+        } catch (\Throwable $e) {
+            return null;
+        }
+
+        return $row ?: null;
+    }
+
+    /**
+     * 按原文缩略名查找同语言译文。
+     *
+     * @param string $lang
+     * @param string $slug
+     * @param string $type
+     * @return array|null
+     */
+    private static function fetchContentTranslationBySourceSlug(string $lang, string $slug, string $type): ?array
+    {
+        $db = Db::get();
+
+        try {
+            $row = $db->fetchRow(
+                $db->select(
+                    'table.multilang_contents.cid',
+                    'table.multilang_contents.slug',
+                    ['table.contents.slug' => 'source_slug']
+                )
+                    ->from('table.multilang_contents')
+                    ->join('table.contents', 'table.contents.cid = table.multilang_contents.cid')
+                    ->where('table.multilang_contents.lang = ?', strtolower($lang))
+                    ->where('table.contents.slug = ?', $slug)
+                    ->where('table.contents.type = ?', $type)
+                    ->limit(1)
+            );
+        } catch (\Throwable $e) {
+            return null;
+        }
+
+        return $row ?: null;
+    }
+
+    /**
+     * 按译文缩略名查找分类/标签。
+     *
+     * @param string $lang
+     * @param string $slug
+     * @param string $type
+     * @return array|null
+     */
+    private static function fetchMetaTranslationBySlug(string $lang, string $slug, string $type): ?array
+    {
+        $db = Db::get();
+
+        try {
+            $row = $db->fetchRow(
+                $db->select(
+                    'table.multilang_metas.mid',
+                    'table.multilang_metas.slug',
+                    ['table.metas.slug' => 'source_slug']
+                )
+                    ->from('table.multilang_metas')
+                    ->join('table.metas', 'table.metas.mid = table.multilang_metas.mid')
+                    ->where('table.multilang_metas.lang = ?', strtolower($lang))
+                    ->where('table.multilang_metas.slug = ?', $slug)
+                    ->where('table.metas.type = ?', $type)
+                    ->limit(1)
+            );
+        } catch (\Throwable $e) {
+            return null;
+        }
+
+        return $row ?: null;
+    }
+
+    /**
+     * 按原文缩略名查找分类/标签译文。
+     *
+     * @param string $lang
+     * @param string $slug
+     * @return array|null
+     */
+    private static function fetchMetaTranslationBySourceSlug(string $lang, string $slug): ?array
+    {
+        $db = Db::get();
+
+        try {
+            $row = $db->fetchRow(
+                $db->select('table.multilang_metas.mid', 'table.multilang_metas.slug')
+                    ->from('table.multilang_metas')
+                    ->join('table.metas', 'table.metas.mid = table.multilang_metas.mid')
+                    ->where('table.multilang_metas.lang = ?', strtolower($lang))
+                    ->where('table.metas.slug = ?', $slug)
+                    ->limit(1)
+            );
+        } catch (\Throwable $e) {
+            return null;
+        }
+
+        return $row ?: null;
+    }
+
+    /**
+     * 内容译文缩略名冲突检查。
+     *
+     * @param string $slug
+     * @param string $lang
+     * @param int $excludeCid
+     * @param string $type post|page
+     * @param array|null $routes
+     * @return string|null
+     */
+    public static function contentTranslationSlugError(
+        string $slug,
+        string $lang,
+        int $excludeCid,
+        string $type,
+        ?array $routes = null
+    ): ?string {
+        $slug = self::normalizeTranslationSlug($slug);
+        if ($slug === '') {
+            return null;
+        }
+
+        $lang = strtolower($lang);
+        $languages = self::languageMap();
+        if (isset($languages[$slug])) {
+            return sprintf(_t('译文缩略名 “%s” 与语言代码冲突，请换一个缩略名。'), $slug);
+        }
+
+        $db = Db::get();
+        try {
+            $sameTranslation = $db->fetchRow(
+                $db->select('cid')->from('table.multilang_contents')
+                    ->where('lang = ?', $lang)
+                    ->where('slug = ?', $slug)
+                    ->where('cid <> ?', $excludeCid)
+                    ->limit(1)
+            );
+            if ($sameTranslation) {
+                return sprintf(_t('译文缩略名 “%s” 已被其他内容译文使用。'), $slug);
+            }
+
+            $sameSource = $db->fetchRow(
+                $db->select('cid', 'type')->from('table.contents')
+                    ->where('slug = ?', $slug)
+                    ->where('cid <> ?', $excludeCid)
+                    ->limit(1)
+            );
+            if ($sameSource) {
+                return sprintf(
+                    _t('译文缩略名 “%s” 与%s缩略名冲突。'),
+                    $slug,
+                    ($sameSource['type'] ?? '') === 'page' ? _t('页面') : _t('文章')
+                );
+            }
+        } catch (\Throwable $e) {
+            return null;
+        }
+
+        try {
+            $categorySlugs = self::categorySlugs(true);
+        } catch (\Throwable $e) {
+            $categorySlugs = [];
+        }
+
+        foreach ($categorySlugs as $categorySlug) {
+            if (strtolower(trim((string)$categorySlug)) === $slug) {
+                return sprintf(_t('译文缩略名 “%s” 与分类目录冲突。'), $slug);
+            }
+        }
+
+        if (self::slugOccupiesFirstSegment($type, $routes) && isset(self::staticReservedSegments($routes)[$slug])) {
+            return sprintf(_t('译文缩略名 “%s” 与路由路径冲突。'), $slug);
+        }
+
+        return null;
+    }
+
+    /**
+     * 分类/标签译文缩略名冲突检查。
+     *
+     * @param string $slug
+     * @param string $lang
+     * @param int $excludeMid
+     * @param string $type category|tag
+     * @param array|null $routes
+     * @return string|null
+     */
+    public static function metaTranslationSlugError(
+        string $slug,
+        string $lang,
+        int $excludeMid,
+        string $type,
+        ?array $routes = null
+    ): ?string {
+        $slug = self::normalizeTranslationSlug($slug);
+        if ($slug === '') {
+            return null;
+        }
+
+        $lang = strtolower($lang);
+        $languages = self::languageMap();
+        if (isset($languages[$slug])) {
+            return sprintf(_t('译文缩略名 “%s” 与语言代码冲突，请换一个缩略名。'), $slug);
+        }
+
+        $db = Db::get();
+        try {
+            $sameTranslation = $db->fetchRow(
+                $db->select('mid')->from('table.multilang_metas')
+                    ->where('lang = ?', $lang)
+                    ->where('slug = ?', $slug)
+                    ->where('mid <> ?', $excludeMid)
+                    ->limit(1)
+            );
+            if ($sameTranslation) {
+                return sprintf(_t('译文缩略名 “%s” 已被其他分类/标签译文使用。'), $slug);
+            }
+
+            $sameSource = $db->fetchRow(
+                $db->select('mid', 'type')->from('table.metas')
+                    ->where('slug = ?', $slug)
+                    ->where('mid <> ?', $excludeMid)
+                    ->limit(1)
+            );
+            if ($sameSource) {
+                return sprintf(
+                    _t('译文缩略名 “%s” 与%s缩略名冲突。'),
+                    $slug,
+                    ($sameSource['type'] ?? '') === 'category' ? _t('分类') : _t('标签')
+                );
+            }
+        } catch (\Throwable $e) {
+            return null;
+        }
+
+        if (self::routeFirstSegmentIsParam($type, 'slug', $routes) && isset(self::staticReservedSegments($routes)[$slug])) {
+            return sprintf(_t('译文缩略名 “%s” 与路由路径冲突。'), $slug);
+        }
+
+        return null;
+    }
+
+    /**
+     * 检查现有译文缩略名在指定路由表下是否仍安全。
+     *
+     * @param array<string, string> $languages
+     * @param array|null $routes
+     * @return array<int, string>
+     */
+    public static function translationSlugConflicts(array $languages, ?array $routes = null): array
+    {
+        $messages = [];
+        $seen = [];
+        $db = Db::get();
+
+        try {
+            $contents = $db->fetchAll(
+                $db->select(
+                    'table.multilang_contents.cid',
+                    'table.multilang_contents.lang',
+                    'table.multilang_contents.slug',
+                    ['table.contents.type' => 'type']
+                )
+                    ->from('table.multilang_contents')
+                    ->join('table.contents', 'table.contents.cid = table.multilang_contents.cid')
+                    ->where('table.multilang_contents.slug <> ?', '')
+            );
+        } catch (\Throwable $e) {
+            $contents = [];
+        }
+
+        foreach ($contents as $row) {
+            if (!isset($languages[$row['lang']])) {
+                continue;
+            }
+            $message = self::contentTranslationSlugError(
+                (string)$row['slug'],
+                (string)$row['lang'],
+                (int)$row['cid'],
+                (string)$row['type'],
+                $routes
+            );
+            if ($message !== null && !isset($seen[$message])) {
+                $seen[$message] = true;
+                $messages[] = $message;
+            }
+        }
+
+        try {
+            $metas = $db->fetchAll(
+                $db->select(
+                    'table.multilang_metas.mid',
+                    'table.multilang_metas.lang',
+                    'table.multilang_metas.slug',
+                    ['table.metas.type' => 'type']
+                )
+                    ->from('table.multilang_metas')
+                    ->join('table.metas', 'table.metas.mid = table.multilang_metas.mid')
+                    ->where('table.multilang_metas.slug <> ?', '')
+            );
+        } catch (\Throwable $e) {
+            $metas = [];
+        }
+
+        foreach ($metas as $row) {
+            if (!isset($languages[$row['lang']])) {
+                continue;
+            }
+            $message = self::metaTranslationSlugError(
+                (string)$row['slug'],
+                (string)$row['lang'],
+                (int)$row['mid'],
+                (string)$row['type'],
+                $routes
+            );
+            if ($message !== null && !isset($seen[$message])) {
+                $seen[$message] = true;
+                $messages[] = $message;
+            }
+        }
+
+        return $messages;
+    }
+
+    /**
+     * 指定类型的缩略名是否会占用路径第一段。
+     *
+     * @param string $type
+     * @param array|null $routes
+     * @return bool
+     */
+    private static function slugOccupiesFirstSegment(string $type, ?array $routes = null): bool
+    {
+        if ($type === 'page') {
+            return true;
+        }
+
+        return self::routeFirstSegmentIsParam($type, 'slug', $routes);
+    }
+
+    /**
+     * 路由中纯静态的第一段。
+     *
+     * @param array|null $routes
+     * @return array<string, bool>
+     */
+    private static function staticReservedSegments(?array $routes = null): array
+    {
+        $reserved = [];
+        foreach ($routes ?? self::parsedRoutes() as $name => $route) {
+            if (self::isOwnRoute((string)$name)) {
+                continue;
+            }
+            $first = self::staticFirstSegment($route);
+            if ($first !== '') {
+                $reserved[$first] = true;
+            }
+        }
+
+        return $reserved;
     }
 
     /**
@@ -370,6 +1111,7 @@ class Plugin implements PluginInterface
      */
     public static function begin(): void
     {
+        self::ensureSchema();
         self::ensureRoutes();
         self::ensureAction();
         self::registerRouteHooks();
@@ -718,7 +1460,23 @@ class Plugin implements PluginInterface
             $path = substr($path, strlen($sitePath));
         }
 
-        $path = self::stripLanguagePrefix('/' . ltrim($path, '/'));
+        $path = '/' . ltrim($path, '/');
+        $fromLang = self::defaultLang();
+        if (preg_match('#^/([^/]+)(/.*)?$#', $path, $matches)) {
+            $candidate = strtolower($matches[1]);
+            if (isset(self::languageMap()[$candidate])) {
+                $fromLang = $candidate;
+                $path = $matches[2] ?? '/';
+            }
+        }
+
+        if ($fromLang !== $lang) {
+            $localized = self::localizePath(rawurldecode($path), $fromLang, $lang);
+            if ($localized !== null) {
+                $path = $localized;
+            }
+        }
+
         $prefix = self::shouldPrefixLang($lang) ? '/' . $lang : '';
         $parts['path'] = self::normalizePath($sitePath . $prefix . $path);
 
@@ -733,6 +1491,289 @@ class Plugin implements PluginInterface
         }
 
         return Common::buildUrl($parts);
+    }
+
+    /**
+     * 把一条站内路径转换成目标语言的等价路径。
+     *
+     * 只处理文章、页面、分类和标签；其他路径返回 null 由调用方自行加前缀。
+     *
+     * @param string $path 已去掉语言前缀的路径
+     * @param string $fromLang
+     * @param string $toLang
+     * @return string|null
+     */
+    private static function localizePath(string $path, string $fromLang, string $toLang): ?string
+    {
+        $match = self::matchContentPath($path);
+        if ($match === null) {
+            return null;
+        }
+
+        $routeName = $match['name'];
+        $params = $match['params'];
+        if (!in_array($routeName, ['post', 'page', 'category', 'tag'], true)) {
+            return null;
+        }
+
+        if ($routeName === 'post' || $routeName === 'page') {
+            $cid = 0;
+            $sourceSlug = '';
+            $hasSlug = isset($params['slug']) && $params['slug'] !== '';
+            $hasDirectory = isset($params['directory']) && $params['directory'] !== '';
+
+            if ($routeName === 'post' && isset($params['cid']) && (int)$params['cid'] > 0) {
+                $content = self::fetchContentByCid((int)$params['cid'], 'post');
+                if ($content === null) {
+                    return null;
+                }
+                $cid = (int)$content['cid'];
+                $sourceSlug = (string)$content['slug'];
+            } else {
+                if ($hasSlug) {
+                    $candidate = $params['slug'];
+                } elseif ($routeName === 'page' && $hasDirectory) {
+                    $candidate = self::lastPathSegment($params['directory']);
+                } else {
+                    return null;
+                }
+
+                $translation = $fromLang !== self::defaultLang()
+                    ? self::fetchContentTranslationBySlug($fromLang, $candidate, $routeName)
+                    : null;
+
+                if ($translation) {
+                    $cid = (int)$translation['cid'];
+                    $sourceSlug = (string)($translation['source_slug'] ?? '');
+                } else {
+                    $content = self::fetchContentBySlug($candidate, $routeName);
+                    if ($content === null) {
+                        return null;
+                    }
+                    $cid = (int)$content['cid'];
+                    $sourceSlug = (string)$content['slug'];
+                }
+            }
+
+            if ($sourceSlug === '') {
+                return null;
+            }
+
+            $targetSlug = $sourceSlug;
+            if ($toLang !== self::defaultLang()) {
+                $translation = self::fetchContentTranslation($cid, $toLang);
+                if ($translation && !empty($translation['slug'])) {
+                    $targetSlug = (string)$translation['slug'];
+                }
+            }
+
+            if ($hasSlug) {
+                $params['slug'] = urlencode($targetSlug);
+            }
+
+            if ($routeName === 'page' && $hasDirectory) {
+                $params['directory'] = implode('/', array_map(
+                    'urlencode',
+                    self::translatedPageDirectory($cid, $toLang)
+                ));
+            }
+
+            if ($routeName === 'post') {
+                if (isset($params['category']) && $params['category'] !== '') {
+                    $categoryPath = self::translatedCategoryDirectory($cid, $toLang);
+                    if ($categoryPath) {
+                        $params['category'] = urlencode((string)end($categoryPath));
+                    }
+                }
+                if (isset($params['directory']) && $params['directory'] !== '') {
+                    $categoryPath = self::translatedCategoryDirectory($cid, $toLang);
+                    if ($categoryPath) {
+                        $params['directory'] = implode('/', array_map('urlencode', $categoryPath));
+                    }
+                }
+            }
+        } else {
+            if (!isset($params['slug']) || $params['slug'] === '') {
+                return null;
+            }
+
+            $translation = $fromLang !== self::defaultLang()
+                ? self::fetchMetaTranslationBySlug($fromLang, $params['slug'], $routeName)
+                : null;
+
+            if ($translation) {
+                $mid = (int)$translation['mid'];
+                $sourceSlug = (string)($translation['source_slug'] ?? '');
+            } else {
+                $meta = self::fetchMetaBySlug($params['slug'], $routeName);
+                if ($meta === null) {
+                    return null;
+                }
+                $mid = (int)$meta['mid'];
+                $sourceSlug = (string)$meta['slug'];
+            }
+
+            if ($sourceSlug === '') {
+                return null;
+            }
+
+            $targetSlug = $sourceSlug;
+            if ($toLang !== self::defaultLang()) {
+                $translation = self::fetchMetaTranslation($mid, $toLang);
+                if ($translation && !empty($translation['slug'])) {
+                    $targetSlug = (string)$translation['slug'];
+                }
+            }
+
+            $params['slug'] = urlencode($targetSlug);
+        }
+
+        $url = Router::url($routeName, $params, '');
+        if ($url === '#' || $url === '') {
+            return null;
+        }
+
+        $parts = parse_url($url);
+        return is_array($parts) ? (string)($parts['path'] ?? null) : null;
+    }
+
+    /**
+     * 匹配站内内容路由。
+     *
+     * @param string $path
+     * @return array{name:string,params:array<string,string>,route:array}|null
+     */
+    private static function matchContentPath(string $path): ?array
+    {
+        foreach (self::parsedRoutes() as $name => $route) {
+            if (self::isOwnRoute((string)$name) || empty($route['regx']) || empty($route['params'])) {
+                continue;
+            }
+
+            if (preg_match($route['regx'], $path, $matches)) {
+                array_shift($matches);
+                $params = [];
+                foreach ($route['params'] as $index => $param) {
+                    $params[$param] = (string)($matches[$index] ?? '');
+                }
+
+                return [
+                    'name'   => (string)$name,
+                    'params' => $params,
+                    'route'  => $route,
+                ];
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * @param int $cid
+     * @param string $type
+     * @return array|null
+     */
+    private static function fetchContentByCid(int $cid, string $type): ?array
+    {
+        try {
+            $row = Db::get()->fetchRow(
+                Db::get()->select('cid', 'slug', 'type')->from('table.contents')
+                    ->where('cid = ?', $cid)->where('type = ?', $type)->limit(1)
+            );
+        } catch (\Throwable $e) {
+            return null;
+        }
+
+        return $row ?: null;
+    }
+
+    /**
+     * @param string $slug
+     * @param string $type
+     * @return array|null
+     */
+    private static function fetchContentBySlug(string $slug, string $type): ?array
+    {
+        try {
+            $row = Db::get()->fetchRow(
+                Db::get()->select('cid', 'slug', 'type')->from('table.contents')
+                    ->where('slug = ?', $slug)->where('type = ?', $type)->limit(1)
+            );
+        } catch (\Throwable $e) {
+            return null;
+        }
+
+        return $row ?: null;
+    }
+
+    /**
+     * @param string $slug
+     * @param string $type
+     * @return array|null
+     */
+    private static function fetchMetaBySlug(string $slug, string $type): ?array
+    {
+        try {
+            $row = Db::get()->fetchRow(
+                Db::get()->select('mid', 'slug', 'type')->from('table.metas')
+                    ->where('slug = ?', $slug)->where('type = ?', $type)->limit(1)
+            );
+        } catch (\Throwable $e) {
+            return null;
+        }
+
+        return $row ?: null;
+    }
+
+    /**
+     * 文章所属分类的完整目录（含自身）。
+     *
+     * @param int $cid
+     * @param string $lang
+     * @return array<int, string>
+     */
+    private static function translatedCategoryDirectory(int $cid, string $lang): array
+    {
+        try {
+            $db = Db::get();
+            $row = $db->fetchRow(
+                $db->select('table.metas.mid', 'table.metas.slug', 'table.metas.parent')
+                    ->from('table.metas')
+                    ->join('table.relationships', 'table.relationships.mid = table.metas.mid')
+                    ->where('table.relationships.cid = ?', $cid)
+                    ->where('table.metas.type = ?', 'category')
+                    ->order('table.metas.mid', Db::SORT_ASC)
+                    ->limit(1)
+            );
+        } catch (\Throwable $e) {
+            return [];
+        }
+
+        if (!$row) {
+            return [];
+        }
+
+        $slugs = [];
+        $seen = [];
+        $mid = (int)$row['mid'];
+        while ($mid > 0 && !isset($seen[$mid])) {
+            $seen[$mid] = true;
+            try {
+                $meta = $db->fetchRow(
+                    $db->select('mid', 'slug', 'parent')->from('table.metas')
+                        ->where('mid = ?', $mid)->where('type = ?', 'category')->limit(1)
+                );
+            } catch (\Throwable $e) {
+                break;
+            }
+            if (!$meta) {
+                break;
+            }
+            array_unshift($slugs, (string)$meta['slug']);
+            $mid = (int)$meta['parent'];
+        }
+
+        return self::translateMetaDirectory($slugs, $lang);
     }
 
     /**
@@ -798,9 +1839,9 @@ class Plugin implements PluginInterface
         return $route['params'][0] ?? null;
     }
 
-    private static function routeFirstSegmentIsParam(string $routeName, string $param): bool
+    private static function routeFirstSegmentIsParam(string $routeName, string $param, ?array $routes = null): bool
     {
-        $route = self::parsedRoutes()[$routeName] ?? null;
+        $route = ($routes ?? self::parsedRoutes())[$routeName] ?? null;
 
         return is_array($route) && self::routeLeadingParam($route) === $param;
     }
@@ -925,6 +1966,10 @@ class Plugin implements PluginInterface
             // 译文自身的前缀决定 Markdown/HTML，不再按原文猜格式。
             $row['text'] = (string)$translation['text'];
         }
+        if (!empty($translation['slug'])) {
+            // 译文缩略名用于生成当前语言的 permalink；路由层会再映射回原文查询。
+            $row['slug'] = (string)$translation['slug'];
+        }
 
         return $row;
     }
@@ -972,7 +2017,8 @@ class Plugin implements PluginInterface
 
         $row['title'] = $title;
         $row['text'] = $text;
-        // slug 暂不用于译文路由，保持原文 slug，避免 core applySlug 改掉原文 URL。
+        // 供编辑页填写译文缩略名；prepareWrite() 会在保存前换回原文 slug。
+        $row['slug'] = $translation && !empty($translation['slug']) ? (string)$translation['slug'] : '';
         return $row;
     }
 
@@ -1016,6 +2062,7 @@ class Plugin implements PluginInterface
             'lang'  => $lang,
             'title' => (string)($contents['title'] ?? ''),
             'text'  => $translatedText,
+            'slug'  => self::normalizeTranslationSlug((string)($contents['slug'] ?? '')),
         ];
 
         // 恢复原文的语言无关字段，避免在译文模式下误改原文。
@@ -1089,6 +2136,9 @@ class Plugin implements PluginInterface
         if (isset($translation['description']) && $translation['description'] !== '') {
             $row['description'] = $translation['description'];
         }
+        if (!empty($translation['slug'])) {
+            $row['slug'] = (string)$translation['slug'];
+        }
 
         return $row;
     }
@@ -1112,12 +2162,13 @@ class Plugin implements PluginInterface
             $lang = (string)($translation['lang'] ?? '');
             $title = trim((string)($translation['title'] ?? ''));
             $text = (string)($translation['text'] ?? '');
+            $slug = self::normalizeTranslationSlug((string)($translation['slug'] ?? ''));
 
             if (isset(self::languageMap()[$lang]) && $lang !== self::defaultLang()) {
                 if ($title === '' && $text === '') {
                     self::deleteContentTranslation($cid, $lang);
                 } else {
-                    self::upsertContentTranslation($cid, $lang, $title, $text, '');
+                    self::upsertContentTranslation($cid, $lang, $title, $text, $slug);
                 }
             }
             return;
@@ -1139,7 +2190,7 @@ class Plugin implements PluginInterface
 
             $title = trim((string)($data['title'] ?? ''));
             $text = (string)($data['text'] ?? '');
-            $slug = trim((string)($data['slug'] ?? ''));
+            $slug = self::normalizeTranslationSlug((string)($data['slug'] ?? ''));
 
             if ($title === '' && $text === '') {
                 self::deleteContentTranslation($cid, $lang);
@@ -1233,7 +2284,6 @@ class Plugin implements PluginInterface
             if (!$translation) {
                 echo ' <span class="description">' . _t('尚无译文') . '</span>';
             }
-            echo '<style>.typecho-post-area .url-slug{display:none;}</style>';
         }
 
         echo '</div>';
@@ -1580,13 +2630,14 @@ class Plugin implements PluginInterface
             return;
         }
 
+        $slug = self::normalizeTranslationSlug($slug);
         $db = Db::get();
         $exists = $db->fetchRow(
             $db->select()->from('table.multilang_metas')
                 ->where('mid = ?', $mid)->where('lang = ?', $lang)->limit(1)
         );
 
-        if ($name === '' && $description === '') {
+        if ($name === '' && $slug === '' && $description === '') {
             if ($exists) {
                 $db->query($db->delete('table.multilang_metas')
                     ->where('mid = ?', $mid)->where('lang = ?', $lang));
@@ -1594,9 +2645,13 @@ class Plugin implements PluginInterface
             return;
         }
 
+        if ($slug !== '') {
+            $slug = self::uniqueMetaTranslationSlug($slug, $lang, $mid);
+        }
+
         $rows = [
             'name'        => $name,
-            'slug'        => $slug,
+            'slug'        => $slug === '' ? null : $slug,
             'description' => $description,
         ];
 
@@ -1657,11 +2712,12 @@ class Plugin implements PluginInterface
      * 可能把某个参数放在路径第一段的内置路由。
      *
      * @param array<string, string> $languages
+     * @param array|null $routes
      * @return array<string, array{slug:string,label:string}> code => conflict
      */
-    public static function conflictingSlugs(array $languages): array
+    public static function conflictingSlugs(array $languages, ?array $routes = null): array
     {
-        $reserved = self::reservedFirstSegments();
+        $reserved = self::reservedFirstSegments($routes);
         $conflicts = [];
 
         foreach ($languages as $code => $name) {
@@ -1724,13 +2780,14 @@ class Plugin implements PluginInterface
     /**
      * 当前站点的路径第一段保留值。
      *
+     * @param array|null $routes
      * @return array<string, array{slug:string,label:string}>
      */
-    private static function reservedFirstSegments(): array
+    private static function reservedFirstSegments(?array $routes = null): array
     {
         $reserved = [];
 
-        foreach (self::parsedRoutes() as $name => $route) {
+        foreach ($routes ?? self::parsedRoutes() as $name => $route) {
             if (self::isOwnRoute($name)) {
                 continue;
             }
@@ -1875,7 +2932,7 @@ class Plugin implements PluginInterface
 
         $config = self::getConfig();
         $data = self::defaultConfig();
-        foreach (['detect', 'autoSwitcher', 'dropTables', 'pathMode'] as $key) {
+        foreach (['detect', 'autoSwitcher', 'dropTables', 'pathMode', 'schemaVersion'] as $key) {
             $value = $config->{$key} ?? null;
             if ($value !== null) {
                 $data[$key] = (string)$value;
@@ -2176,6 +3233,8 @@ class Plugin implements PluginInterface
         } else {
             throw new PluginException(_t('当前数据库适配器 %s 暂不支持', $adapter));
         }
+
+        self::ensureTranslationIndexes($db, $prefix, $adapter);
     }
 
     private static function installMysqlTables(Db $db, string $prefix): void
@@ -2190,7 +3249,7 @@ class Plugin implements PluginInterface
                 `created` int(10) DEFAULT 0,
                 `modified` int(10) DEFAULT 0,
                 PRIMARY KEY (`cid`, `lang`),
-                KEY `{$prefix}ml_contents_lang_slug` (`lang`, `slug`)
+                UNIQUE KEY `{$prefix}ml_contents_lang_slug_unique` (`lang`, `slug`)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
 
             "CREATE TABLE IF NOT EXISTS `{$prefix}multilang_metas` (
@@ -2200,7 +3259,7 @@ class Plugin implements PluginInterface
                 `slug` varchar(150) DEFAULT NULL,
                 `description` varchar(255) DEFAULT NULL,
                 PRIMARY KEY (`mid`, `lang`),
-                KEY `{$prefix}ml_metas_lang_slug` (`lang`, `slug`)
+                UNIQUE KEY `{$prefix}ml_metas_lang_slug_unique` (`lang`, `slug`)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
 
             "CREATE TABLE IF NOT EXISTS `{$prefix}multilang_fields` (
@@ -2237,7 +3296,7 @@ class Plugin implements PluginInterface
                 \"modified\" INTEGER DEFAULT 0,
                 PRIMARY KEY (\"cid\", \"lang\")
             )",
-            "CREATE INDEX IF NOT EXISTS \"{$prefix}ml_contents_lang_slug\"
+            "CREATE UNIQUE INDEX IF NOT EXISTS \"{$prefix}ml_contents_lang_slug_unique\"
                 ON \"{$prefix}multilang_contents\" (\"lang\", \"slug\")",
 
             "CREATE TABLE IF NOT EXISTS \"{$prefix}multilang_metas\" (
@@ -2248,7 +3307,7 @@ class Plugin implements PluginInterface
                 \"description\" varchar(255) DEFAULT NULL,
                 PRIMARY KEY (\"mid\", \"lang\")
             )",
-            "CREATE INDEX IF NOT EXISTS \"{$prefix}ml_metas_lang_slug\"
+            "CREATE UNIQUE INDEX IF NOT EXISTS \"{$prefix}ml_metas_lang_slug_unique\"
                 ON \"{$prefix}multilang_metas\" (\"lang\", \"slug\")",
 
             "CREATE TABLE IF NOT EXISTS \"{$prefix}multilang_fields\" (
@@ -2285,7 +3344,7 @@ class Plugin implements PluginInterface
                 \"modified\" integer DEFAULT 0,
                 PRIMARY KEY (\"cid\", \"lang\")
             )",
-            "CREATE INDEX IF NOT EXISTS \"{$prefix}ml_contents_lang_slug\"
+            "CREATE UNIQUE INDEX IF NOT EXISTS \"{$prefix}ml_contents_lang_slug_unique\"
                 ON \"{$prefix}multilang_contents\" (\"lang\", \"slug\")",
 
             "CREATE TABLE IF NOT EXISTS \"{$prefix}multilang_metas\" (
@@ -2296,7 +3355,7 @@ class Plugin implements PluginInterface
                 \"description\" varchar(255),
                 PRIMARY KEY (\"mid\", \"lang\")
             )",
-            "CREATE INDEX IF NOT EXISTS \"{$prefix}ml_metas_lang_slug\"
+            "CREATE UNIQUE INDEX IF NOT EXISTS \"{$prefix}ml_metas_lang_slug_unique\"
                 ON \"{$prefix}multilang_metas\" (\"lang\", \"slug\")",
 
             "CREATE TABLE IF NOT EXISTS \"{$prefix}multilang_fields\" (
@@ -2317,6 +3376,187 @@ class Plugin implements PluginInterface
 
         foreach ($statements as $sql) {
             $db->query($sql, Db::WRITE);
+        }
+    }
+
+    /**
+     * 升级旧安装：确保 (lang, slug) 唯一索引存在。
+     */
+    private static function ensureSchema(): void
+    {
+        static $checked = false;
+
+        if ($checked) {
+            return;
+        }
+        $checked = true;
+
+        $config = self::getConfig();
+        if ((string)($config->schemaVersion ?? '') === (string)self::SCHEMA_VERSION) {
+            return;
+        }
+
+        $db = Db::get();
+        $prefix = $db->getPrefix();
+        $adapter = $db->getAdapterName();
+        if (!self::ensureTranslationIndexes($db, $prefix, $adapter)) {
+            return;
+        }
+
+        $data = self::defaultConfig();
+        foreach (
+            ['languages', 'default', 'detect', 'autoSwitcher', 'dropTables', 'pathMode', 'schemaVersion'] as $key
+        ) {
+            $value = $config->{$key} ?? null;
+            if ($value !== null) {
+                $data[$key] = (string)$value;
+            }
+        }
+        $data['schemaVersion'] = (string)self::SCHEMA_VERSION;
+
+        try {
+            \Widget\Plugins\Edit::configPlugin('MultiLanguage', $data);
+        } catch (\Throwable $e) {
+            // 配置写入失败时下次请求会重试迁移，不影响前台请求。
+        }
+    }
+
+    /**
+     * 清理旧数据中的重复译文缩略名，再建立唯一索引。
+     *
+     * @param Db $db
+     * @param string $prefix
+     * @param string $adapter
+     * @return bool
+     */
+    private static function ensureTranslationIndexes(Db $db, string $prefix, string $adapter): bool
+    {
+        self::dedupeTranslationSlugs($db, 'multilang_contents', 'cid');
+        self::dedupeTranslationSlugs($db, 'multilang_metas', 'mid');
+
+        $indexes = [
+            ["{$prefix}multilang_contents", "{$prefix}ml_contents_lang_slug_unique"],
+            ["{$prefix}multilang_metas", "{$prefix}ml_metas_lang_slug_unique"],
+        ];
+
+        $ok = true;
+        foreach ($indexes as [$table, $index]) {
+            if (stripos($adapter, 'Mysql') !== false) {
+                try {
+                    $db->query(
+                        "CREATE UNIQUE INDEX `{$index}` ON `{$table}` (`lang`, `slug`)",
+                        Db::WRITE
+                    );
+                } catch (\Throwable $e) {
+                    $message = $e->getMessage();
+                    if (
+                        stripos($message, 'Duplicate key name') === false
+                        && stripos($message, 'already exists') === false
+                    ) {
+                        $ok = false;
+                    }
+                }
+            } else {
+                try {
+                    $db->query(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS \"{$index}\""
+                        . " ON \"{$table}\" (\"lang\", \"slug\")",
+                        Db::WRITE
+                    );
+                } catch (\Throwable $e) {
+                    $ok = false;
+                }
+            }
+        }
+
+        return $ok;
+    }
+
+    /**
+     * 重复缩略名会保留最早的一条，其余清空以回退到原文地址。
+     *
+     * @param Db $db
+     * @param string $table
+     * @param string $idColumn
+     */
+    private static function dedupeTranslationSlugs(Db $db, string $table, string $idColumn): void
+    {
+        try {
+            // 空字符串会占用唯一索引，统一转换为 NULL。
+            $db->query(
+                $db->update('table.' . $table)->rows(['slug' => null])->where('slug = ?', '')
+            );
+        } catch (\Throwable $e) {
+            // 忽略：旧数据可能没有该列或表尚未创建。
+        }
+
+        try {
+            $rows = $db->fetchAll(
+                $db->select($idColumn, 'lang', 'slug')
+                    ->from('table.' . $table)
+                    ->where('slug <> ?', '')
+            );
+        } catch (\Throwable $e) {
+            return;
+        }
+
+        $seen = [];
+        foreach ($rows as $row) {
+            $slug = trim((string)$row['slug']);
+            if ($slug === '') {
+                continue;
+            }
+
+            $key = strtolower((string)$row['lang']) . "\0" . strtolower($slug);
+            if (!isset($seen[$key])) {
+                $seen[$key] = true;
+                continue;
+            }
+
+            try {
+                $db->query(
+                    $db->update('table.' . $table)
+                        ->rows(['slug' => null])
+                        ->where($idColumn . ' = ?', (int)$row[$idColumn])
+                        ->where('lang = ?', $row['lang'])
+                );
+            } catch (\Throwable $e) {
+                // 清理失败时保留数据；唯一索引创建会失败，下次再重试。
+            }
+        }
+
+        // 统一大小写，避免旧数据出现只有大小写不同的地址。
+        try {
+            $rows = $db->fetchAll(
+                $db->select($idColumn, 'lang', 'slug')
+                    ->from('table.' . $table)
+                    ->where('slug <> ?', '')
+            );
+        } catch (\Throwable $e) {
+            return;
+        }
+
+        foreach ($rows as $row) {
+            $slug = trim((string)$row['slug']);
+            if ($slug === '') {
+                continue;
+            }
+
+            $normalized = strtolower($slug);
+            if ($normalized === $slug) {
+                continue;
+            }
+
+            try {
+                $db->query(
+                    $db->update('table.' . $table)
+                        ->rows(['slug' => $normalized])
+                        ->where($idColumn . ' = ?', (int)$row[$idColumn])
+                        ->where('lang = ?', $row['lang'])
+                );
+            } catch (\Throwable $e) {
+                // 与已有小写缩略名冲突时保留原值，交由冲突检查提示。
+            }
         }
     }
 
@@ -2383,6 +3623,10 @@ class Plugin implements PluginInterface
         string $slug
     ): void {
         $db = Db::get();
+        $slug = self::normalizeTranslationSlug($slug);
+        if ($slug !== '') {
+            $slug = self::uniqueContentTranslationSlug($slug, $lang, $cid);
+        }
         $exists = self::fetchContentTranslation($cid, $lang);
         $rows = [
             'title'    => $title === '' ? null : htmlspecialchars($title, ENT_QUOTES, 'UTF-8'),
@@ -2399,6 +3643,80 @@ class Plugin implements PluginInterface
             $rows['lang'] = $lang;
             $rows['created'] = time();
             $db->query($db->insert('table.multilang_contents')->rows($rows));
+        }
+    }
+
+    /**
+     * 避免并发或旧数据造成 (lang, slug) 重复，自动追加序号。
+     *
+     * @param string $slug
+     * @param string $lang
+     * @param int $cid
+     * @return string
+     */
+    private static function uniqueContentTranslationSlug(string $slug, string $lang, int $cid): string
+    {
+        $db = Db::get();
+        $base = $slug;
+        $candidate = $slug;
+        $index = 2;
+
+        while (true) {
+            try {
+                $row = $db->fetchRow(
+                    $db->select('cid')->from('table.multilang_contents')
+                        ->where('lang = ?', strtolower($lang))
+                        ->where('slug = ?', $candidate)
+                        ->where('cid <> ?', $cid)
+                        ->limit(1)
+                );
+            } catch (\Throwable $e) {
+                return $candidate;
+            }
+
+            if (!$row) {
+                return $candidate;
+            }
+
+            $candidate = $base . '-' . $index;
+            $index++;
+        }
+    }
+
+    /**
+     * 避免分类/标签译文缩略名重复。
+     *
+     * @param string $slug
+     * @param string $lang
+     * @param int $mid
+     * @return string
+     */
+    private static function uniqueMetaTranslationSlug(string $slug, string $lang, int $mid): string
+    {
+        $db = Db::get();
+        $base = $slug;
+        $candidate = $slug;
+        $index = 2;
+
+        while (true) {
+            try {
+                $row = $db->fetchRow(
+                    $db->select('mid')->from('table.multilang_metas')
+                        ->where('lang = ?', strtolower($lang))
+                        ->where('slug = ?', $candidate)
+                        ->where('mid <> ?', $mid)
+                        ->limit(1)
+                );
+            } catch (\Throwable $e) {
+                return $candidate;
+            }
+
+            if (!$row) {
+                return $candidate;
+            }
+
+            $candidate = $base . '-' . $index;
+            $index++;
         }
     }
 
